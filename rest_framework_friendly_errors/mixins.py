@@ -1,5 +1,6 @@
 from __future__ import unicode_literals
 
+import inspect
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import ValidationError as RestValidationError
 from rest_framework.utils.serializer_helpers import ReturnDict
@@ -135,7 +136,13 @@ class FriendlyErrorMessagesMixin(FieldMap):
 
     def _run_validator(self, validator, field, message):
         try:
-            validator(self.initial_data[field.field_name])
+            validator_args = []
+            validator_expected_args = inspect.getfullargspec(validator).args
+            if 'value' in validator_expected_args:
+                validator_args.append(self.initial_data[field.field_name])
+            if 'serializer_field' in validator_expected_args:
+                validator_args.append(field)
+            validator(*validator_args)
         except (DjangoValidationError, RestValidationError) as err:
             err_message = err.detail[0] \
                 if hasattr(err, 'detail') else err.message

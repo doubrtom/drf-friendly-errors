@@ -3,6 +3,7 @@ from __future__ import unicode_literals
 import inspect
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import ValidationError as RestValidationError
+from rest_framework.serializers import Serializer, BaseSerializer
 from rest_framework.utils.serializer_helpers import ReturnDict
 
 from rest_framework_friendly_errors import settings
@@ -61,7 +62,8 @@ class FriendlyErrorMessagesMixin(FieldMap):
     def get_field_kwargs(self, field, field_data):
         field_type = field.__class__.__name__
         kwargs = {
-            'data_type': type(field_data).__name__
+            'data_type': type(field_data).__name__,
+            'input_type': type(field_data).__name__,
         }
         if field_type in self.field_map['boolean']:
             kwargs.update({'input': field_data})
@@ -172,8 +174,8 @@ class FriendlyErrorMessagesMixin(FieldMap):
                         'message': error}
             # Here we know that error was raised by custom validate method
             # in serializer
-            validator = getattr(self, "validate_%s" % field.field_name)
-            if self._run_validator(validator, field, error):
+            validator = getattr(self, "validate_%s" % field.field_name, None)
+            if validator and self._run_validator(validator, field, error):
                 name = validator.__name__
                 code = self.FIELD_VALIDATION_ERRORS.get(name) or settings.FRIENDLY_VALIDATOR_ERRORS.get(name)
                 return {'code': code, 'field': field.field_name,
@@ -201,6 +203,65 @@ class FriendlyErrorMessagesMixin(FieldMap):
     def get_non_field_error_entries(self, errors):
         return [self.get_non_field_error_entry(error) for error in errors]
 
+    def wrap_nested_errors(self, code, errors, field_name):
+        return {
+            'code': code,  # todo: code for nested exceptions
+            'field': field_name,
+            'errors': errors
+        }
+
+    def get_sub_serializer_errors(self, serializer, error_type):
+        """Return sub-serializer errors
+
+        Returns
+        -------
+        dict
+            DRF-friendly-error dict for sub-serializer with many=False
+        list
+            list of DRF-friendly-error for sub-serializer with many=True
+        """
+        serializer.initial_data = self.initial_data.get(error_type)
+        if hasattr(serializer, 'get_subclass'):  # todo: check
+            try:
+                # try to get specialized serializer, when InheritanceModelSerializer
+                # it can fail, when 'type' is missing or incorrect
+                serializer = serializer.get_subclass()
+            except:
+                pass
+        # Here is recursion, again calling DRF-friendly-errors for sub-serializer:
+        serializer.is_valid()
+        return serializer.errors
+
+    def process_sub_serializer_errors(self, serializer_error_dict, error_type):
+        """Convert all sub-serializer errors into DRF-friendly-error formats."""
+        sub_serializer_errors = serializer_error_dict.get('errors', [])
+        sub_serializer_non_field_errors = serializer_error_dict.get('non_field_errors', None)
+        result = []
+        for sub_error in sub_serializer_errors:
+            if sub_error['field'] is None:
+                sub_error['field'] = error_type
+            result.append(sub_error)
+        if sub_serializer_non_field_errors is not None:
+            result.extend(
+                self.get_non_field_error_entries(sub_serializer_non_field_errors)
+            )
+        return result
+
+    def process_sub_serializer(self, pretty, serializer, error_type):
+        """Process serializer field, which is also serializer."""
+        field_errors = self.get_sub_serializer_errors(serializer, error_type)
+        if isinstance(field_errors, list):
+            # serializer with many=True
+            list_errors = []
+            for inner_field_errors in field_errors:
+                # sub_serializer_errors = self.process_sub_serializer_errors(inner_field_errors, error_type)
+                list_errors.append(self.process_sub_serializer_errors(inner_field_errors, error_type))
+            pretty.append(self.wrap_nested_errors(2902, list_errors, error_type))
+        else:
+            # serializer with many=False
+            sub_serializer_errors = self.process_sub_serializer_errors(field_errors, error_type)
+            pretty.append(self.wrap_nested_errors(2901, sub_serializer_errors, error_type))
+
     def build_pretty_errors(self, errors):
         pretty = []
         for error_type in errors:
@@ -209,6 +270,14 @@ class FriendlyErrorMessagesMixin(FieldMap):
                     errors[error_type]))
             else:
                 field = self.fields[error_type]
+
+                # If error field is serializer, do recursion to convert nested errors
+                # If there is no data for field (nested serializer), DO NOT DO recursion,
+                # it is just 'required' field error maybe.
+                if isinstance(field, BaseSerializer) and error_type in self.initial_data:
+                    self.process_sub_serializer(pretty, field, error_type)
+                    continue
+
                 pretty.extend(
                     self.get_field_error_entries(errors[error_type], field),
                 )
